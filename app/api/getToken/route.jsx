@@ -1,21 +1,35 @@
-import { AssemblyAI } from "assemblyai";
 import { NextResponse } from "next/server";
-
-const client = new AssemblyAI({
-  apiKey: process.env.ASSEMBLYAI_API_KEY,
-});
 
 export async function GET() {
   try {
-    // Generates a temporary, 60-second token for the Realtime API
-    const { token } = await client.streaming.createTemporaryToken({
-      expires_in_seconds: 60,
+    // Generate temporary token using direct API call as per documentation
+    // https://www.assemblyai.com/docs/api-reference/streaming-api/generate-streaming-token
+    const response = await fetch(
+      `https://streaming.assemblyai.com/v3/token?expires_in_seconds=300&max_session_duration_seconds=1800`,
+      {
+        method: 'GET',
+        headers: {
+          'Authorization': process.env.ASSEMBLYAI_API_KEY,
+        },
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`Token generation failed: ${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    console.log("✅ Generated temporary token for Universal Streaming API");
+    console.log(`Token expires in ${data.expires_in_seconds} seconds`);
+    
+    return NextResponse.json({ 
+      token: data.token,
+      expires_in_seconds: data.expires_in_seconds 
     });
-    return NextResponse.json({ token });
   } catch (error) {
-    console.error("Error creating AssemblyAI token:", error);
+    console.error("❌ Error creating AssemblyAI token:", error);
     return NextResponse.json(
-      { error: "Failed to generate token" },
+      { error: "Failed to generate token", details: error.message },
       { status: 500 }
     );
   }

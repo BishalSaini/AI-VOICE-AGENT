@@ -18,6 +18,7 @@ function DiscussionRoom() {
 
   const [expert, setExpert] = useState();
   const [enableMic, setEnableMic] = useState(false);
+  const [isConnected, setIsConnected] = useState(false);
 
   // store final + partial transcripts
   const [transcripts, setTranscripts] = useState([]); 
@@ -36,6 +37,22 @@ function DiscussionRoom() {
     }
   }, [DiscussionRoomData]);
 
+  // Cleanup effect to ensure proper disconnection
+  useEffect(() => {
+    return () => {
+      // Cleanup when component unmounts
+      if (ws.current) {
+        ws.current.close();
+      }
+      if (recorder.current) {
+        recorder.current.stopRecording();
+      }
+      if (silenceTimeout.current) {
+        clearTimeout(silenceTimeout.current);
+      }
+    };
+  }, []);
+
   // NOTE: Removed the unused base64Encode function.
 
   const connectToServer = async () => {
@@ -43,38 +60,74 @@ function DiscussionRoom() {
 
     const { token } = await getToken();
 
-    // AssemblyAI realtime WebSocket
+    // AssemblyAI Universal Streaming WebSocket
     // Use sample_rate=16000 as required for optimal performance.
-    const wsUrl = `wss://api.assemblyai.com/v2/realtime/ws?sample_rate=16000&token=${token}`;
+    const wsUrl = `wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&format_turns=true&token=${token}`;
     ws.current = new WebSocket(wsUrl);
 
     ws.current.onopen = () => {
-      console.log("✅ Connected to AssemblyAI Realtime");
+      console.log("✅ Connected to AssemblyAI Universal Streaming API");
+      setIsConnected(true);
     };
 
     ws.current.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
+      try {
+        const msg = JSON.parse(event.data);
+        console.log("📨 Received message:", msg);
 
-      // Check for API-side errors
-      if (msg.error) {
+        // Handle session begin
+        if (msg.type === "Begin") {
+          console.log("✅ Session started:", msg.id, "Expires at:", new Date(msg.expires_at * 1000));
+          return;
+        }
+
+        // Handle turn events (Universal Streaming API format)
+        if (msg.type === "Turn") {
+          console.log("🎤 Turn event:", {
+            transcript: msg.transcript,
+            end_of_turn: msg.end_of_turn,
+            turn_is_formatted: msg.turn_is_formatted
+          });
+
+          // Show partial transcript (ongoing speech)
+          if (!msg.end_of_turn) {
+            console.log("🎤 You are saying (live):", msg.transcript);
+            setPartial(msg.transcript);
+          }
+          
+          // Handle end of turn (final transcript)
+          if (msg.end_of_turn) {
+            console.log("✅ You said:", msg.transcript);
+            console.log("📝 Complete transcript so far:", [...transcripts, msg.transcript].join(" "));
+            setTranscripts((prev) => [...prev, msg.transcript]);
+            setPartial(""); // Clear partial transcript
+          }
+        }
+
+        // Handle session termination
+        if (msg.type === "Termination") {
+          console.log("🛑 Session terminated:", msg);
+        }
+
+        // Handle errors
+        if (msg.error) {
           console.error("❌ AssemblyAI API Error:", msg.error);
-      }
-
-      if (msg.message_type === "PartialTranscript") {
-        console.log("🎤 You are saying (live):", msg.text); // LIVE speech in console
-        setPartial(msg.text); 
-      }
-
-      if (msg.message_type === "FinalTranscript") {
-        console.log("✅ You said:", msg.text); // FINAL speech in console
-        console.log("📝 Complete transcript so far:", [...transcripts, msg.text].join(" "));
-        setTranscripts((prev) => [...prev, msg.text]); 
-        setPartial(""); 
+        }
+      } catch (error) {
+        console.error("❌ Error parsing WebSocket message:", error, event.data);
       }
     };
 
     ws.current.onerror = (err) => {
       console.error("❌ WebSocket error:", err);
+      setEnableMic(false);
+      setIsConnected(false);
+    };
+
+    ws.current.onclose = (event) => {
+      console.log("🔌 WebSocket connection closed:", event.code, event.reason);
+      setEnableMic(false);
+      setIsConnected(false);
     };
 
     navigator.mediaDevices
@@ -82,28 +135,33 @@ function DiscussionRoom() {
       .then((stream) => {
         recorder.current = new RecordRTC(stream, {
           type: "audio",
-          // Use audio/wav for reliable raw PCM data chunks
-          mimeType: "audio/wav", 
+          // Use audio/wav for PCM16 encoding compatible with AssemblyAI
+          mimeType: "audio/wav",
           recorderType: RecordRTC.StereoAudioRecorder,
-          timeSlice: 250, // Send chunk every 250ms
-          desiredSampRate: 16000,
-          numberOfAudioChannels: 1,
+          timeSlice: 100, // Send chunk every 100ms (recommended for streaming)
+          desiredSampRate: 16000, // Required sample rate for AssemblyAI
+          numberOfAudioChannels: 1, // Mono channel required
           bufferSize: 4096,
 
-          // Send audio chunks to AssemblyAI
+          // Send audio chunks to AssemblyAI Universal Streaming API
           ondataavailable: async (blob) => {
             if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
 
             clearTimeout(silenceTimeout.current);
 
-            const buffer = await blob.arrayBuffer();
-            
-            // CRITICAL FIX: Send the raw ArrayBuffer (binary data) directly
-            ws.current.send(buffer); 
-
-            silenceTimeout.current = setTimeout(() => {
-              console.log("User stopped talking.");
-            }, 2000);
+            try {
+              // Convert blob to ArrayBuffer for PCM16 data
+              const arrayBuffer = await blob.arrayBuffer();
+              
+              // Send raw PCM audio data directly as binary
+              ws.current.send(arrayBuffer);
+              
+              silenceTimeout.current = setTimeout(() => {
+                console.log("User stopped talking.");
+              }, 2000);
+            } catch (error) {
+              console.error("Error sending audio data:", error);
+            }
           },
         });
 
@@ -112,28 +170,49 @@ function DiscussionRoom() {
       })
       .catch((err) => {
         console.error("⚠️ Error accessing microphone:", err);
+        setEnableMic(false);
+        
+        // Provide user-friendly error messages
+        if (err.name === 'NotAllowedError') {
+          alert('Microphone access denied. Please allow microphone access and try again.');
+        } else if (err.name === 'NotFoundError') {
+          alert('No microphone found. Please ensure a microphone is connected.');
+        } else {
+          alert('Error accessing microphone: ' + err.message);
+        }
       });
   };
 
   const disconnect = async () => {
-    if (ws.current) {
+    // Send session termination message before closing
+    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+      try {
+        ws.current.send(JSON.stringify({ type: "Terminate" }));
+        console.log("📤 Sent termination message");
+      } catch (error) {
+        console.error("❌ Error sending termination message:", error);
+      }
+      
+      // Close WebSocket connection
       ws.current.close();
       ws.current = null;
     }
 
+    // Stop audio recording
     if (recorder.current) {
       recorder.current.stopRecording(() => {
-        
         // Log the successful creation of the final audio blob
         const audioBlob = recorder.current.getBlob();
         console.log(`💾 Final audio blob created: ${audioBlob.type} -> ${Math.round(audioBlob.size / 1024)} KB`);
         
         recorder.current = null;
         setEnableMic(false);
+        setIsConnected(false);
         console.log("🛑 Stopped recording audio stream.");
       });
     }
 
+    // Clear timeouts
     if (silenceTimeout.current) {
       clearTimeout(silenceTimeout.current);
     }
@@ -159,25 +238,48 @@ function DiscussionRoom() {
               <UserButton />
             </div>
           </div>
-          <div className="mt-5 flex items-center justify-center">
+          <div className="mt-5 flex items-center justify-center gap-4">
             {!enableMic ? (
-              <Button onClick={connectToServer}>Connect</Button>
-            ) : (
-              <Button variant="destructive" onClick={disconnect}>
-                Disconnect
+              <Button onClick={connectToServer} className="px-8">
+                🎤 Start Recording
               </Button>
+            ) : (
+              <div className="flex items-center gap-4">
+                <div className="flex items-center gap-2">
+                  <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse"></div>
+                  <span className="text-sm text-red-600 font-medium">Recording</span>
+                </div>
+                <Button variant="destructive" onClick={disconnect} className="px-8">
+                  🛑 Stop Recording
+                </Button>
+              </div>
             )}
           </div>
         </div>
         <div>
           <div className="h-[60vh] bg-secondary border rounded-4xl flex flex-col items-start p-4 overflow-y-auto">
-            <h2 className="font-bold mb-2">Live Transcript</h2>
-            <div className="space-y-1 text-sm text-gray-700 w-full">
+            <div className="flex items-center justify-between w-full mb-2">
+              <h2 className="font-bold">Live Transcript</h2>
+              <div className="flex items-center gap-2">
+                <div className={`w-3 h-3 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`}></div>
+                <span className="text-xs text-gray-500">
+                  {isConnected ? 'Connected' : 'Disconnected'}
+                </span>
+              </div>
+            </div>
+            <div className="space-y-2 text-sm text-gray-700 w-full">
+              {transcripts.length === 0 && !partial && (
+                <p className="text-gray-400 italic">Start speaking to see live transcription...</p>
+              )}
               {transcripts.map((line, i) => (
-                <p key={i}>{line}</p>
+                <div key={i} className="p-2 bg-white rounded border-l-4 border-blue-500">
+                  <p className="text-gray-800">{line}</p>
+                </div>
               ))}
               {partial && (
-                <p className="text-gray-500 italic">{partial}</p> 
+                <div className="p-2 bg-yellow-50 rounded border-l-4 border-yellow-400">
+                  <p className="text-gray-600 italic">🎤 {partial}</p>
+                </div>
               )}
             </div>
           </div>
